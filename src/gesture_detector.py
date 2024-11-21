@@ -1,3 +1,4 @@
+# src/gesture_detector.py
 import numpy as np
 from datetime import datetime, timedelta
 import requests
@@ -15,6 +16,15 @@ class GestureType(Enum):
     HOLD = "hold"
 
 @dataclass
+class GestureSettings:
+    tap_threshold: float = 2.0
+    met_activity_threshold: float = 1.5
+    hold_stability_threshold: float = 0.5
+    hold_min_duration: int = 8
+    rotation_min_duration: int = 2
+    rotation_max_gap: int = 1
+
+@dataclass
 class Gesture:
     start_time: int
     end_time: Optional[int]
@@ -23,16 +33,17 @@ class Gesture:
     metadata: Dict
 
 class OuraGestureDetector:
-    def __init__(self):
+    def __init__(self, settings: GestureSettings = None):
         self.token = "3QQI4OHBZZMUHTMWPDPTRZR6A3TSR23V"
         self.base_url = "https://api.ouraring.com/v2/usercollection/daily_activity"
         
-        self.tap_threshold = 3
-        self.rotation_min_duration = 2
-        self.rotation_max_gap = 1
-        self.hold_min_duration = 6
-        self.hold_stability_threshold = 0.3
-        self.met_activity_threshold = 2.0
+        settings = settings or GestureSettings()
+        self.tap_threshold = settings.tap_threshold
+        self.rotation_min_duration = settings.rotation_min_duration
+        self.rotation_max_gap = settings.rotation_max_gap
+        self.hold_min_duration = settings.hold_min_duration
+        self.hold_stability_threshold = settings.hold_stability_threshold
+        self.met_activity_threshold = settings.met_activity_threshold
 
     def get_motion_data(self, start_date: str, end_date: str) -> Dict:
         headers = {'Authorization': f'Bearer {self.token}'}
