@@ -22,7 +22,10 @@ class GestureSettings:
     hold_stability_threshold: float = 0.5
     hold_min_duration: int = 8
     rotation_min_duration: int = 2
-    rotation_max_gap: int = 1
+    rotation_max_gap: int = 2
+    rotation_merge_threshold: int = 4
+    min_hold_met: float = 0.3
+    max_hold_met: float = 1.2
 
 @dataclass
 class Gesture:
@@ -44,6 +47,9 @@ class OuraGestureDetector:
         self.hold_min_duration = settings.hold_min_duration
         self.hold_stability_threshold = settings.hold_stability_threshold
         self.met_activity_threshold = settings.met_activity_threshold
+        self.rotation_merge_threshold = settings.rotation_merge_threshold
+        self.min_hold_met = settings.min_hold_met
+        self.max_hold_met = settings.max_hold_met
 
     def get_motion_data(self, start_date: str, end_date: str) -> Dict:
         headers = {'Authorization': f'Bearer {self.token}'}
@@ -62,7 +68,6 @@ class OuraGestureDetector:
             motion_array = np.array([int(x) for x in motion_data['data'][0]['class_5_min']])
             met_array = np.array(motion_data['data'][0]['met']['items'])
             
-            # Resample met_array to match motion_array length
             met_indices = np.linspace(0, len(met_array)-1, len(motion_array)).astype(int)
             met_array = met_array[met_indices]
             
@@ -73,7 +78,9 @@ class OuraGestureDetector:
 
         gestures = []
         gestures.extend(self._detect_taps(motion_array, met_array))
-        gestures.extend(self._detect_rotations(motion_array, met_array))
+        rotations = self._detect_rotations(motion_array, met_array)
+        merged_rotations = self._merge_nearby_rotations(rotations)
+        gestures.extend(merged_rotations)
         gestures.extend(self._detect_holds(motion_array, met_array))
         
         return self._remove_overlapping_gestures(gestures)
@@ -86,13 +93,14 @@ class OuraGestureDetector:
         
         for idx in tap_indices:
             confidence = min(1.0, (diffs[idx] / self.tap_threshold) * (met_array[idx] / self.met_activity_threshold))
-            taps.append(Gesture(
-                start_time=int(idx),
-                end_time=int(idx + 1),
-                type=GestureType.TAP,
-                confidence=float(confidence),
-                metadata={"met": float(met_array[idx])}
-            ))
+            if confidence > 0.7:  # Only include high confidence taps
+                taps.append(Gesture(
+                    start_time=int(idx),
+                    end_time=int(idx + 1),
+                    type=GestureType.TAP,
+                    confidence=float(confidence),
+                    metadata={"met": float(met_array[idx])}
+                ))
         return taps
 
     def _detect_rotations(self, motion_array: np.ndarray, met_array: np.ndarray) -> List[Gesture]:
@@ -112,18 +120,50 @@ class OuraGestureDetector:
                     avg_met = np.mean(met_array[start:end])
                     if avg_met > self.met_activity_threshold:
                         confidence = min(1.0, duration / self.rotation_min_duration * (avg_met / self.met_activity_threshold))
-                        rotations.append(Gesture(
-                            start_time=int(start),
-                            end_time=int(end),
-                            type=GestureType.ROTATION,
-                            confidence=float(confidence),
-                            metadata={
-                                "duration": int(duration),
-                                "avg_met": float(avg_met)
-                            }
-                        ))
+                        if confidence > 0.5:  # Only include medium-high confidence rotations
+                            rotations.append(Gesture(
+                                start_time=int(start),
+                                end_time=int(end),
+                                type=GestureType.ROTATION,
+                                confidence=float(confidence),
+                                metadata={
+                                    "duration": int(duration),
+                                    "avg_met": float(avg_met)
+                                }
+                            ))
             i += 1
         return rotations
+
+    def _merge_nearby_rotations(self, rotations: List[Gesture]) -> List[Gesture]:
+        if not rotations:
+            return []
+            
+        merged = []
+        current = rotations[0]
+        
+        for next_rotation in rotations[1:]:
+            if next_rotation.start_time - current.end_time <= self.rotation_merge_threshold:
+                # Merge rotations
+                duration = next_rotation.end_time - current.start_time
+                avg_met = (current.metadata["avg_met"] * current.metadata["duration"] + 
+                         next_rotation.metadata["avg_met"] * next_rotation.metadata["duration"]) / duration
+                
+                current = Gesture(
+                    start_time=current.start_time,
+                    end_time=next_rotation.end_time,
+                    type=GestureType.ROTATION,
+                    confidence=max(current.confidence, next_rotation.confidence),
+                    metadata={
+                        "duration": duration,
+                        "avg_met": float(avg_met)
+                    }
+                )
+            else:
+                merged.append(current)
+                current = next_rotation
+        
+        merged.append(current)
+        return merged
 
     def _detect_holds(self, motion_array: np.ndarray, met_array: np.ndarray) -> List[Gesture]:
         holds = []
@@ -137,18 +177,25 @@ class OuraGestureDetector:
                 
                 duration = end - i
                 avg_met = np.mean(met_array[i:end])
-                stability = 1 - (np.std(motion_array[i:end]) / self.hold_stability_threshold)
                 
-                holds.append(Gesture(
-                    start_time=int(i),
-                    end_time=int(end),
-                    type=GestureType.HOLD,
-                    confidence=float(stability),
-                    metadata={
-                        "duration": int(duration),
-                        "avg_met": float(avg_met)
-                    }
-                ))
+                # Only detect holds during rest/low activity periods
+                if self.min_hold_met <= avg_met <= self.max_hold_met:
+                    stability = 1 - (np.std(motion_array[i:end]) / self.hold_stability_threshold)
+                    
+                    # Adjust confidence based on duration and stability
+                    confidence = stability * min(1.0, duration / (self.hold_min_duration * 2))
+                    
+                    if confidence > 0.3:  # Filter out low confidence holds
+                        holds.append(Gesture(
+                            start_time=int(i),
+                            end_time=int(end),
+                            type=GestureType.HOLD,
+                            confidence=float(confidence),
+                            metadata={
+                                "duration": int(duration),
+                                "avg_met": float(avg_met)
+                            }
+                        ))
                 i = end
             i += 1
         return holds
@@ -164,7 +211,7 @@ class OuraGestureDetector:
             prev = result[-1]
             if current.start_time >= prev.end_time:
                 result.append(current)
-            elif current.confidence > prev.confidence:
+            elif current.confidence > prev.confidence * 1.2:  # Add hysteresis
                 result[-1] = current
                 
         return result
