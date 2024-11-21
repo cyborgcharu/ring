@@ -27,7 +27,6 @@ class OuraGestureDetector:
         self.token = "3QQI4OHBZZMUHTMWPDPTRZR6A3TSR23V"
         self.base_url = "https://api.ouraring.com/v2/usercollection/daily_activity"
         
-        # Refined sensitivity parameters
         self.tap_threshold = 3
         self.rotation_min_duration = 2
         self.rotation_max_gap = 1
@@ -51,6 +50,12 @@ class OuraGestureDetector:
         try:
             motion_array = np.array([int(x) for x in motion_data['data'][0]['class_5_min']])
             met_array = np.array(motion_data['data'][0]['met']['items'])
+            
+            # Resample met_array to match motion_array length
+            met_indices = np.linspace(0, len(met_array)-1, len(motion_array)).astype(int)
+            met_array = met_array[met_indices]
+            
+            logging.info(f"Motion array length: {len(motion_array)}, MET array length: {len(met_array)}")
         except (KeyError, IndexError) as e:
             logging.error(f"Failed to process motion data: {e}")
             return []
@@ -65,7 +70,8 @@ class OuraGestureDetector:
     def _detect_taps(self, motion_array: np.ndarray, met_array: np.ndarray) -> List[Gesture]:
         taps = []
         diffs = np.abs(np.diff(motion_array))
-        tap_indices = np.where((diffs > self.tap_threshold) & (met_array[:-1] > self.met_activity_threshold))[0]
+        met_mask = met_array[:-1] > self.met_activity_threshold
+        tap_indices = np.where((diffs > self.tap_threshold) & met_mask)[0]
         
         for idx in tap_indices:
             confidence = min(1.0, (diffs[idx] / self.tap_threshold) * (met_array[idx] / self.met_activity_threshold))
