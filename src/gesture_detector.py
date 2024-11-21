@@ -2,6 +2,9 @@ import requests
 import numpy as np
 from datetime import datetime, timedelta
 import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 class OuraGestureDetector:
     def __init__(self):
@@ -11,13 +14,17 @@ class OuraGestureDetector:
     def get_motion_data(self, start_date, end_date):
         headers = {'Authorization': f'Bearer {self.token}'}
         params = {'start_date': start_date, 'end_date': end_date}
-        return requests.get(self.base_url, headers=headers, params=params).json()
+        response = requests.get(self.base_url, headers=headers, params=params)
+        logging.info(f"Motion data response: {response.json()}")
+        return response.json()
 
     def detect_gestures(self, motion_data):
         try:
             motion_array = np.array([int(x) for x in motion_data['data'][0]['class_5_min']])
+            logging.info(f"Motion array: {motion_array}")
         except (KeyError, IndexError):
             motion_array = np.array([1, 2, 3, 4, 3, 2, 1, 4, 3, 2])
+            logging.info(f"Motion array (fallback): {motion_array}")
 
         taps = np.where(np.abs(np.diff(motion_array)) > 2)[0].tolist()
         rotations = np.where(motion_array == 3)[0].tolist()
@@ -34,8 +41,9 @@ class OuraGestureDetector:
 
 def test_gesture_detection():
     detector = OuraGestureDetector()
-    dates = datetime.now(), datetime.now() - timedelta(days=1)
-    motion_data = detector.get_motion_data(*(date.strftime("%Y-%m-%d") for date in dates))
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    motion_data = detector.get_motion_data(start_date, end_date)
     gestures = detector.detect_gestures(motion_data)
     actions = [{'time': time, 'type': gesture_type, 'action': detector.map_to_actions(gesture_type, None)} 
                for gesture_type, times in gestures.items() for time in times]
