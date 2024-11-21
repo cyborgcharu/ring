@@ -12,7 +12,6 @@ logging.basicConfig(level=logging.INFO)
 class GestureType(Enum):
     TAP = "tap"
     ROTATION = "rotation"
-    DOUBLE_TAP = "double_tap"
     HOLD = "hold"
 
 @dataclass
@@ -24,16 +23,18 @@ class Gesture:
     metadata: Dict
 
 class OuraGestureDetector:
-    def __init__(self, token: str):
+    def __init__(self):
         self.token = "3QQI4OHBZZMUHTMWPDPTRZR6A3TSR23V"
         self.base_url = "https://api.ouraring.com/v2/usercollection/daily_activity"
         
-        # Gesture detection parameters
-        self.tap_threshold = 2
-        self.rotation_threshold = 3
-        self.double_tap_max_gap = 3  # max time units between taps
-        self.hold_min_duration = 4    # min time units for hold
-        
+        # Refined sensitivity parameters
+        self.tap_threshold = 3
+        self.rotation_min_duration = 2
+        self.rotation_max_gap = 1
+        self.hold_min_duration = 6
+        self.hold_stability_threshold = 0.3
+        self.met_activity_threshold = 2.0
+
     def get_motion_data(self, start_date: str, end_date: str) -> Dict:
         headers = {'Authorization': f'Bearer {self.token}'}
         params = {'start_date': start_date, 'end_date': end_date}
@@ -57,7 +58,6 @@ class OuraGestureDetector:
         gestures = []
         gestures.extend(self._detect_taps(motion_array, met_array))
         gestures.extend(self._detect_rotations(motion_array, met_array))
-        gestures.extend(self._detect_double_taps(motion_array, met_array))
         gestures.extend(self._detect_holds(motion_array, met_array))
         
         return self._remove_overlapping_gestures(gestures)
@@ -65,97 +65,75 @@ class OuraGestureDetector:
     def _detect_taps(self, motion_array: np.ndarray, met_array: np.ndarray) -> List[Gesture]:
         taps = []
         diffs = np.abs(np.diff(motion_array))
-        tap_indices = np.where(diffs > self.tap_threshold)[0]
+        tap_indices = np.where((diffs > self.tap_threshold) & (met_array[:-1] > self.met_activity_threshold))[0]
         
         for idx in tap_indices:
-            confidence = min(1.0, diffs[idx] / (self.tap_threshold * 2))
-            met_value = met_array[idx] if idx < len(met_array) else 0
-            
+            confidence = min(1.0, (diffs[idx] / self.tap_threshold) * (met_array[idx] / self.met_activity_threshold))
             taps.append(Gesture(
                 start_time=int(idx),
                 end_time=int(idx + 1),
                 type=GestureType.TAP,
                 confidence=float(confidence),
-                metadata={"met": float(met_value)}
+                metadata={"met": float(met_array[idx])}
             ))
-        
         return taps
 
     def _detect_rotations(self, motion_array: np.ndarray, met_array: np.ndarray) -> List[Gesture]:
         rotations = []
-        rotation_mask = motion_array == self.rotation_threshold
-        rotation_starts = np.where(np.diff(rotation_mask.astype(int)) == 1)[0]
-        rotation_ends = np.where(np.diff(rotation_mask.astype(int)) == -1)[0]
+        rotation_mask = motion_array == 3
         
-        for start, end in zip(rotation_starts, rotation_ends):
-            duration = end - start
-            confidence = min(1.0, duration / 3)  # Longer rotations = higher confidence
-            avg_met = np.mean(met_array[start:end+1]) if start < len(met_array) else 0
-            
-            rotations.append(Gesture(
-                start_time=int(start),
-                end_time=int(end),
-                type=GestureType.ROTATION,
-                confidence=float(confidence),
-                metadata={
-                    "duration": int(duration),
-                    "avg_met": float(avg_met)
-                }
-            ))
-        
+        i = 0
+        while i < len(rotation_mask):
+            if rotation_mask[i]:
+                start = i
+                while i < len(rotation_mask) and (rotation_mask[i] or i - start <= self.rotation_max_gap):
+                    i += 1
+                end = i
+                
+                duration = end - start
+                if duration >= self.rotation_min_duration:
+                    avg_met = np.mean(met_array[start:end])
+                    if avg_met > self.met_activity_threshold:
+                        confidence = min(1.0, duration / self.rotation_min_duration * (avg_met / self.met_activity_threshold))
+                        rotations.append(Gesture(
+                            start_time=int(start),
+                            end_time=int(end),
+                            type=GestureType.ROTATION,
+                            confidence=float(confidence),
+                            metadata={
+                                "duration": int(duration),
+                                "avg_met": float(avg_met)
+                            }
+                        ))
+            i += 1
         return rotations
-
-    def _detect_double_taps(self, motion_array: np.ndarray, met_array: np.ndarray) -> List[Gesture]:
-        taps = self._detect_taps(motion_array, met_array)
-        double_taps = []
-        
-        for i in range(len(taps) - 1):
-            if taps[i+1].start_time - taps[i].end_time <= self.double_tap_max_gap:
-                confidence = min(taps[i].confidence, taps[i+1].confidence)
-                double_taps.append(Gesture(
-                    start_time=taps[i].start_time,
-                    end_time=taps[i+1].end_time,
-                    type=GestureType.DOUBLE_TAP,
-                    confidence=confidence,
-                    metadata={"gap": taps[i+1].start_time - taps[i].end_time}
-                ))
-        
-        return double_taps
 
     def _detect_holds(self, motion_array: np.ndarray, met_array: np.ndarray) -> List[Gesture]:
         holds = []
-        stable_regions = np.where(np.abs(np.diff(motion_array)) <= 0.5)[0]
-        
-        if len(stable_regions) == 0:
-            return holds
-            
-        # Group consecutive stable regions
-        hold_starts = [stable_regions[0]]
-        hold_ends = []
-        
-        for i in range(1, len(stable_regions)):
-            if stable_regions[i] - stable_regions[i-1] > 1:
-                hold_ends.append(stable_regions[i-1])
-                hold_starts.append(stable_regions[i])
-        hold_ends.append(stable_regions[-1])
-        
-        for start, end in zip(hold_starts, hold_ends):
-            duration = end - start
-            if duration >= self.hold_min_duration:
-                confidence = min(1.0, duration / (self.hold_min_duration * 2))
-                avg_met = np.mean(met_array[start:end+1]) if start < len(met_array) else 0
+        i = 0
+        while i < len(motion_array) - self.hold_min_duration:
+            window = motion_array[i:i + self.hold_min_duration]
+            if np.std(window) <= self.hold_stability_threshold:
+                end = i + self.hold_min_duration
+                while end < len(motion_array) and np.std(motion_array[i:end+1]) <= self.hold_stability_threshold:
+                    end += 1
+                
+                duration = end - i
+                avg_met = np.mean(met_array[i:end])
+                stability = 1 - (np.std(motion_array[i:end]) / self.hold_stability_threshold)
                 
                 holds.append(Gesture(
-                    start_time=int(start),
+                    start_time=int(i),
                     end_time=int(end),
                     type=GestureType.HOLD,
-                    confidence=float(confidence),
+                    confidence=float(stability),
                     metadata={
                         "duration": int(duration),
                         "avg_met": float(avg_met)
                     }
                 ))
-        
+                i = end
+            i += 1
         return holds
 
     def _remove_overlapping_gestures(self, gestures: List[Gesture]) -> List[Gesture]:
@@ -175,7 +153,7 @@ class OuraGestureDetector:
         return result
 
 def test_gesture_detection():
-    detector = OuraGestureDetector(token="YOUR_TOKEN")
+    detector = OuraGestureDetector()
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
